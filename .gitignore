@@ -1,0 +1,5 @@
+/.what-changed/
+/.cache/
+/bin/
+*.exe
+*.test
