@@ -1,3 +1,3 @@
-module github.com/local-first/what-changed
+module github.com/dineshsuthar123/UseFull-Tools
 
 go 1.25

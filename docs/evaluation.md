@@ -1,4 +1,4 @@
-# MVP evaluation
+# v0.2 evaluation
 
 ## Core friction test
 
@@ -6,30 +6,38 @@ The workflow must meet these acceptance checks:
 
 | Question | Pass condition |
 |---|---|
-| Does it require configuration before first value? | No. One `run -- <command>` creates the baseline. |
+| Does it require configuration before first value? | No. One `run -- <command>` creates that exact command's baseline. |
+| Can different commands replace one another's baseline? | No. Root + executable + ordered arguments produce independent command IDs. |
 | Can a failed test destroy the known-good reference? | No. The child exit code is preserved and nothing is saved. |
 | Does a user need to inspect a raw machine dump? | No. Unchanged data is omitted and findings are ranked. |
-| Can the tool expose source contents or obvious credentials? | Source is hashed; credential-like environment values are redacted. |
+| Can the tool expose source contents or arbitrary environment plaintext? | Source is hashed; unknown and credential-like values are hash-only and hidden. |
+| Can an oversized file become a false removal? | No. Presence is stored separately from content-tracking state. |
 | Does an optional integration failure break the scan? | No. Detector completeness is stored and unsafe comparisons are skipped. |
 | Can output be automated? | Yes. `diff --json`, `mark --json`, and `list --json` are stable JSON. |
 
 ## Test strategy
 
-- unit fixtures for file categories, ignore behavior, hashes, secret names, and
-  three operating-system port formats;
-- comparison tests that assert both score ordering and redaction;
-- a partial-scan test that prevents false “file added” findings;
-- storage tests that prove history is append-only and latest/named lookup works;
-- a subprocess test proving a failing wrapped command returns the same code and
-  creates no checkpoint directory;
-- renderer tests for concise limiting and disclosure of skipped detectors;
-- native end-to-end smoke tests for capture and immediate no-change comparison.
+- stable command ID tests for root normalization, repeatability, and argument
+  ordering;
+- subprocess tests for independent per-command baselines and preservation of a
+  prior success when the same command later fails;
+- oversized-file tests for presence, threshold crossing, size-only changes, and
+  real deletion;
+- privacy tests for common and unusual credential names, arbitrary unknown
+  variables, checkpoint JSON, output redaction, and schema 1 migration;
+- Java, Node, compose-port, and referenced-environment relevance fixtures;
+- deterministic ordering/JSON tests and concise versus verbose rendering tests;
+- missing Git/Docker and partial project-context isolation tests;
+- Windows, Linux, and macOS listening-port parser fixtures;
+- native multi-command, hash-reuse, privacy, text, verbose, and JSON sessions.
 
 ## Benchmark method
 
-`BenchmarkCaptureFiles1000` creates 1,000 small Go files and measures a complete
-walk, SHA-256 hash, classification, and map construction. `BenchmarkCompareTenThousandFiles`
-compares two 10,000-file snapshots with 100 changed files, including ranking.
+`BenchmarkCaptureFiles1000` measures a complete 1,000-file walk, SHA-256 hash,
+classification, and map construction. `BenchmarkProjectContextTenThousandFiles`
+analyzes 10,000 paths plus package/compose fixtures. `BenchmarkCompareTenThousandFiles`
+compares two 10,000-file snapshots with 100 changes, including context-aware
+ranking.
 
 Run locally with:
 
@@ -41,31 +49,39 @@ Measured on 2026-08-20 on Windows/amd64 with an AMD Ryzen 7 8845HS and Go 1.25.6
 
 | Measurement | Result |
 |---|---:|
-| Hash and classify 1,000 small files | 56.2 ms/op |
-| Compare 10,000 files with 100 changes | 0.59 ms/op |
-| Native checkpoint of this repository (29 tracked files plus system detectors) | 348 ms wall time |
-| Native no-change diff, including a fresh system scan | 330 ms wall time |
+| Hash and classify 1,000 small files | 59.4 ms/op |
+| Analyze project context across 10,000 paths | 2.03 ms/op |
+| Compare 10,000 files with 100 changes | 0.72 ms/op |
+| Native checkpoint, five-run median | 301 ms wall time |
+| Native no-change diff, five-run median | 294 ms wall time |
 
 These are local prototype measurements, not cross-platform performance claims.
 The external runtime, Git, Docker, and port probes dominate the small-project
-wall time; the in-memory diff itself is well below one millisecond at 10,000
-files.
+wall time. The new project-context pass adds about 2 ms at 10,000 paths, and the
+in-memory context-aware comparison remains below one millisecond.
 
 ## Decision after MVP
 
-The prototype succeeds if a developer can create a known-good baseline without
-configuration and the later report surfaces a deliberately changed dependency,
-configuration, environment value, or common port above unrelated file noise.
+v0.2 succeeds if independent commands maintain independent known-good states,
+privacy and presence facts survive persistence, and repository evidence moves
+the most locally relevant clues above generic machine noise.
 
 The native smoke scenario passed:
 
-1. `run --name green -- go test ./...` ran the suite and recorded a checkpoint.
-2. An immediate `diff --name green` returned no changes.
-3. A temporary `go.mod` edit and `REDIS_POOL_SIZE=40` produced dependency score
-   96 and environment score 84 as the top two findings.
-4. A wrapped command exiting 7 returned exit code 7 and created no checkpoint.
+1. Two executions of `run -- go test ./...` reused the same command ID;
+   the second reused all 36 file hashes.
+2. `run -- go test ./internal/commandid` created a second independent ID and
+   baseline.
+3. `diff -- go test ./...` selected only the first command and returned no
+   changes immediately after success.
+4. A synthetic unusual credential value was absent from every checkpoint JSON
+   file.
+5. Setting `NODE_ENV=production` after the baseline produced one concise,
+   non-causal environment finding.
+6. Unit/subprocess fixtures proved a later exit 7 preserves the prior successful
+   baseline for that exact command.
 
-The next validation step should be a small field study: ask 5–10 developers to
+The next validation step should be a small field study: ask 5-10 developers to
 wrap their normal test command for one week, then measure (a) checkpoints
 created, (b) failure investigations where at least one top-five finding was
 useful, (c) time to first useful clue, and (d) false or noisy top-five findings.

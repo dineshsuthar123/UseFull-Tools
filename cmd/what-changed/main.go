@@ -5,7 +5,7 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/local-first/what-changed/internal/cli"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/cli"
 )
 
 func main() {

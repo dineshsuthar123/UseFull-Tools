@@ -20,7 +20,7 @@ const (
 
 var ignoredDirectories = map[string]struct{}{
 	".git": {}, ".what-changed": {}, ".gradle": {}, ".idea": {}, ".next": {},
-	".cache": {}, "node_modules": {}, "vendor": {}, "target": {}, "build": {},
+	".cache": {}, "bin": {}, "node_modules": {}, "vendor": {}, "target": {}, "build": {},
 	"dist": {}, "out": {}, "coverage": {}, "__pycache__": {},
 }
 
@@ -47,7 +47,7 @@ var configExtensions = map[string]struct{}{
 	".toml": {}, ".xml": {}, ".yaml": {}, ".yml": {},
 }
 
-func captureFiles(ctx context.Context, root string) (map[string]FileState, Stats, bool, []Diagnostic) {
+func captureFiles(ctx context.Context, root string, previous map[string]FileState) (map[string]FileState, Stats, bool, []Diagnostic) {
 	files := make(map[string]FileState)
 	stats := Stats{}
 	complete := true
@@ -96,8 +96,27 @@ func captureFiles(ctx context.Context, root string) (map[string]FileState, Stats
 			complete = false
 			return nil
 		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			complete = false
+			return nil
+		}
+		relative = filepath.ToSlash(relative)
+		state := FileState{
+			Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), Kind: classifyFile(relative),
+		}
 		if info.Size() > maxTrackedFileSize {
+			state.Reason = "size-limit"
+			files[relative] = state
 			stats.FilesSkippedLarge++
+			return nil
+		}
+		if old, found := previous[relative]; found && old.Tracked && old.SHA256 != "" &&
+			old.Size == state.Size && old.ModTimeUnixNano == state.ModTimeUnixNano {
+			state.Tracked = true
+			state.SHA256 = old.SHA256
+			files[relative] = state
+			stats.FileHashesReused++
 			return nil
 		}
 		digest, err := hashFile(path)
@@ -108,13 +127,9 @@ func captureFiles(ctx context.Context, root string) (map[string]FileState, Stats
 			}
 			return nil
 		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			complete = false
-			return nil
-		}
-		relative = filepath.ToSlash(relative)
-		files[relative] = FileState{SHA256: digest, Size: info.Size(), Kind: classifyFile(relative)}
+		state.Tracked = true
+		state.SHA256 = digest
+		files[relative] = state
 		stats.FilesHashed++
 		return nil
 	})

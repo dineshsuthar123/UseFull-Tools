@@ -1,5 +1,6 @@
 /.what-changed/
 /.cache/
 /bin/
+/dist/
 *.exe
 *.test

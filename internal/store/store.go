@@ -12,7 +12,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/local-first/what-changed/internal/snapshot"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/commandid"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/snapshot"
 )
 
 var ErrNotFound = errors.New("checkpoint not found")
@@ -98,6 +99,19 @@ func Load(root, label string) (*snapshot.Snapshot, string, error) {
 	return nil, "", fmt.Errorf("%w: %s", ErrNotFound, wanted)
 }
 
+func LoadByCommandID(root, commandID string) (*snapshot.Snapshot, string, error) {
+	entries, err := List(root)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, entry := range entries {
+		if entry.Snapshot.CommandID == commandID {
+			return entry.Snapshot, entry.Path, nil
+		}
+	}
+	return nil, "", fmt.Errorf("%w: command %s", ErrNotFound, commandID)
+}
+
 func List(root string) ([]Entry, error) {
 	directory := filepath.Join(root, directoryName)
 	directoryEntries, err := os.ReadDir(directory)
@@ -139,6 +153,14 @@ func read(path string) (*snapshot.Snapshot, error) {
 	var value snapshot.Snapshot
 	if err := decoder.Decode(&value); err != nil {
 		return nil, err
+	}
+	if value.SchemaVersion == 1 {
+		snapshot.UpgradeV1(&value)
+		if len(value.Trigger.Command) > 0 {
+			if id, _, err := commandid.Identity(value.Root, value.Trigger.Command); err == nil {
+				value.CommandID = id
+			}
+		}
 	}
 	if value.SchemaVersion != snapshot.SchemaVersion {
 		return nil, fmt.Errorf("unsupported checkpoint schema %d", value.SchemaVersion)

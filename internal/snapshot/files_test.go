@@ -13,9 +13,10 @@ func TestCaptureFilesHashesUsefulFilesAndIgnoresGeneratedDirectories(t *testing.
 	writeTestFile(t, root, "package-lock.json", "{\"lockfileVersion\": 3}\n")
 	writeTestFile(t, root, "db/migrations/V2__users.sql", "alter table users add active boolean;\n")
 	writeTestFile(t, root, "node_modules/dependency/index.js", "generated\n")
+	writeTestFile(t, root, "bin/application.exe", "generated\n")
 	writeTestFile(t, root, ".what-changed/old.json", "{}\n")
 
-	files, stats, complete, diagnostics := captureFiles(context.Background(), root)
+	files, stats, complete, diagnostics := captureFiles(context.Background(), root, nil)
 	if !complete {
 		t.Fatalf("expected complete scan, diagnostics=%v", diagnostics)
 	}
@@ -34,8 +35,58 @@ func TestCaptureFilesHashesUsefulFilesAndIgnoresGeneratedDirectories(t *testing.
 	if _, found := files["node_modules/dependency/index.js"]; found {
 		t.Fatal("node_modules file should not be tracked")
 	}
+	if _, found := files["bin/application.exe"]; found {
+		t.Fatal("bin output should not be tracked")
+	}
 	if files["src/main.go"].SHA256 == "" {
 		t.Fatal("expected a content digest")
+	}
+}
+
+func TestOversizedFileIsRecordedAsPresentMetadata(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "large.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxTrackedFileSize + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	files, stats, complete, diagnostics := captureFiles(context.Background(), root, nil)
+	if !complete {
+		t.Fatalf("scan incomplete: %v", diagnostics)
+	}
+	state, found := files["large.bin"]
+	if !found {
+		t.Fatal("oversized file disappeared from snapshot")
+	}
+	if state.Tracked || state.Reason != "size-limit" || state.Size != maxTrackedFileSize+1 {
+		t.Fatalf("unexpected oversized state: %#v", state)
+	}
+	if stats.FilesSkippedLarge != 1 {
+		t.Fatalf("FilesSkippedLarge=%d, want 1", stats.FilesSkippedLarge)
+	}
+}
+
+func TestCaptureReusesUnchangedHash(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "main.go", "package main\n")
+	first, _, complete, _ := captureFiles(context.Background(), root, nil)
+	if !complete {
+		t.Fatal("first scan incomplete")
+	}
+	second, stats, complete, _ := captureFiles(context.Background(), root, first)
+	if !complete {
+		t.Fatal("second scan incomplete")
+	}
+	if stats.FileHashesReused != 1 || stats.FilesHashed != 0 {
+		t.Fatalf("stats=%#v, want one reused hash", stats)
+	}
+	if first["main.go"].SHA256 != second["main.go"].SHA256 {
+		t.Fatal("reused digest changed")
 	}
 }
 
@@ -73,7 +124,7 @@ func BenchmarkCaptureFiles1000(b *testing.B) {
 	}
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		_, _, complete, _ := captureFiles(context.Background(), root)
+		_, _, complete, _ := captureFiles(context.Background(), root, nil)
 		if !complete {
 			b.Fatal("scan unexpectedly incomplete")
 		}

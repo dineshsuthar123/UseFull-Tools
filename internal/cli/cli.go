@@ -12,13 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/local-first/what-changed/internal/compare"
-	"github.com/local-first/what-changed/internal/render"
-	"github.com/local-first/what-changed/internal/snapshot"
-	"github.com/local-first/what-changed/internal/store"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/commandid"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/compare"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/render"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/snapshot"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/store"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 type App struct {
 	Stdin  io.Reader
@@ -72,7 +73,7 @@ func (app App) defaults() App {
 
 func (app App) runCommand(ctx context.Context, args []string) int {
 	flags := app.flagSet("run")
-	name := flags.String("name", "last-success", "checkpoint name")
+	name := flags.String("name", "", "optional checkpoint name (advanced)")
 	rootFlag := flags.String("root", ".", "project root and command working directory")
 	note := flags.String("note", "", "short context note")
 	if err := flags.Parse(args); err != nil {
@@ -87,6 +88,11 @@ func (app App) runCommand(ctx context.Context, args []string) int {
 	root, err := projectRoot(*rootFlag)
 	if err != nil {
 		fmt.Fprintf(app.Stderr, "what-changed: %v\n", err)
+		return 1
+	}
+	commandID, _, err := commandid.Identity(root, commandArgs)
+	if err != nil {
+		fmt.Fprintf(app.Stderr, "what-changed: identify command: %v\n", err)
 		return 1
 	}
 	started := app.Now()
@@ -107,9 +113,24 @@ func (app App) runCommand(ctx context.Context, args []string) int {
 		Kind: "successful-command", Command: append([]string(nil), commandArgs...), Note: *note,
 		Duration: finished.Sub(started), ExitCode: 0, FinishedAt: finished.UTC(),
 	}
-	value, err := snapshot.Capture(ctx, snapshot.Options{Root: root, Label: *name, Trigger: trigger, Now: app.Now})
+	label := strings.TrimSpace(*name)
+	if label == "" {
+		label = commandID
+	}
+	previous, _, loadErr := store.LoadByCommandID(root, commandID)
+	if loadErr != nil && !errors.Is(loadErr, store.ErrNotFound) {
+		fmt.Fprintf(app.Stderr, "what-changed: load prior command checkpoint: %v\n", loadErr)
+		return 1
+	}
+	value, err := snapshot.Capture(ctx, snapshot.Options{
+		Root: root, Label: label, CommandID: commandID, Trigger: trigger, Previous: previous, Now: app.Now,
+	})
 	if err != nil {
 		fmt.Fprintf(app.Stderr, "what-changed: command succeeded, but checkpoint capture failed: %v\n", err)
+		return 1
+	}
+	if !value.Complete["files"] {
+		fmt.Fprintln(app.Stderr, "what-changed: command succeeded, but the project file scan was incomplete; prior checkpoint preserved")
 		return 1
 	}
 	path, err := store.Save(root, value)
@@ -139,11 +160,20 @@ func (app App) mark(ctx context.Context, args []string) int {
 		fmt.Fprintf(app.Stderr, "what-changed: %v\n", err)
 		return 1
 	}
+	previous, _, loadErr := store.Load(root, *name)
+	if loadErr != nil && !errors.Is(loadErr, store.ErrNotFound) {
+		fmt.Fprintf(app.Stderr, "what-changed: load prior named checkpoint: %v\n", loadErr)
+		return 1
+	}
 	value, err := snapshot.Capture(ctx, snapshot.Options{
-		Root: root, Label: *name, Trigger: snapshot.Trigger{Kind: "manual", Note: *note}, Now: app.Now,
+		Root: root, Label: *name, Trigger: snapshot.Trigger{Kind: "manual", Note: *note}, Previous: previous, Now: app.Now,
 	})
 	if err != nil {
 		fmt.Fprintf(app.Stderr, "what-changed: capture failed: %v\n", err)
+		return 1
+	}
+	if !value.Complete["files"] {
+		fmt.Fprintln(app.Stderr, "what-changed: project file scan was incomplete; checkpoint not saved")
 		return 1
 	}
 	path, err := store.Save(root, value)
@@ -167,12 +197,14 @@ func (app App) diff(ctx context.Context, args []string) int {
 	name := flags.String("name", "", "checkpoint name (default: latest)")
 	rootFlag := flags.String("root", ".", "project root")
 	jsonOutput := flags.Bool("json", false, "emit JSON")
-	limit := flags.Int("limit", 20, "maximum text findings; 0 shows all")
+	verbose := flags.Bool("verbose", false, "show raw facts and detector details")
+	limit := flags.Int("limit", 10, "maximum text findings; 0 shows all")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if flags.NArg() != 0 {
-		fmt.Fprintf(app.Stderr, "diff does not accept positional arguments: %s\n", strings.Join(flags.Args(), " "))
+	commandArgs := flags.Args()
+	if strings.TrimSpace(*name) != "" && len(commandArgs) > 0 {
+		fmt.Fprintln(app.Stderr, "what-changed: use either --name or a command after --, not both")
 		return 2
 	}
 	if *limit < 0 {
@@ -184,17 +216,32 @@ func (app App) diff(ctx context.Context, args []string) int {
 		fmt.Fprintf(app.Stderr, "what-changed: %v\n", err)
 		return 1
 	}
-	baseline, _, err := store.Load(root, *name)
+	var baseline *snapshot.Snapshot
+	if len(commandArgs) > 0 {
+		commandID, _, identityErr := commandid.Identity(root, commandArgs)
+		if identityErr != nil {
+			fmt.Fprintf(app.Stderr, "what-changed: identify command: %v\n", identityErr)
+			return 1
+		}
+		baseline, _, err = store.LoadByCommandID(root, commandID)
+	} else {
+		baseline, _, err = store.Load(root, *name)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			fmt.Fprintln(app.Stderr, "what-changed: no matching checkpoint; run `what-changed run -- <command>` or `what-changed mark` first")
+			if len(commandArgs) > 0 {
+				fmt.Fprintf(app.Stderr, "what-changed: no successful checkpoint for `%s`; run `what-changed run -- %s` first\n", commandid.Display(commandArgs), commandid.Display(commandArgs))
+			} else {
+				fmt.Fprintln(app.Stderr, "what-changed: no matching checkpoint; run `what-changed run -- <command>` or `what-changed mark` first")
+			}
 		} else {
 			fmt.Fprintf(app.Stderr, "what-changed: load checkpoint: %v\n", err)
 		}
 		return 1
 	}
 	current, err := snapshot.Capture(ctx, snapshot.Options{
-		Root: root, Label: "current", Trigger: snapshot.Trigger{Kind: "comparison"}, Now: app.Now,
+		Root: root, Label: "current", CommandID: baseline.CommandID,
+		Trigger: snapshot.Trigger{Kind: "comparison"}, Previous: baseline, Now: app.Now,
 	})
 	if err != nil {
 		fmt.Fprintf(app.Stderr, "what-changed: current scan failed: %v\n", err)
@@ -204,7 +251,7 @@ func (app App) diff(ctx context.Context, args []string) int {
 	if *jsonOutput {
 		err = render.JSON(app.Stdout, result)
 	} else {
-		err = render.Text(app.Stdout, result, *limit, app.Now())
+		err = render.Text(app.Stdout, result, render.TextOptions{Limit: *limit, Verbose: *verbose, Now: app.Now()})
 	}
 	if err != nil {
 		fmt.Fprintf(app.Stderr, "what-changed: render failed: %v\n", err)
@@ -250,7 +297,11 @@ func (app App) list(args []string) int {
 		if len(entry.Snapshot.Trigger.Command) > 0 {
 			trigger = strings.Join(entry.Snapshot.Trigger.Command, " ")
 		}
-		fmt.Fprintf(app.Stdout, "%-20s %s  %s\n", entry.Snapshot.Label, entry.Snapshot.CapturedAt.Local().Format(time.RFC3339), trigger)
+		identity := entry.Snapshot.CommandID
+		if identity == "" {
+			identity = "manual"
+		}
+		fmt.Fprintf(app.Stdout, "%-24s %-24s %s  %s\n", entry.Snapshot.Label, identity, entry.Snapshot.CapturedAt.Local().Format(time.RFC3339), trigger)
 	}
 	return 0
 }
@@ -266,8 +317,11 @@ func (app App) printCaptured(value *snapshot.Snapshot, path string) {
 			warnings++
 		}
 	}
-	fmt.Fprintf(app.Stdout, "Checkpoint %q recorded: %d files, %d runtimes, %d listening ports (%s).\n",
-		value.Label, value.Stats.FilesHashed, len(value.Runtimes), len(value.Ports), relative)
+	if value.CommandID != "" {
+		fmt.Fprintf(app.Stdout, "Known-good checkpoint for `%s` recorded (%s).\n", commandid.Display(value.Trigger.Command), value.CommandID)
+	}
+	fmt.Fprintf(app.Stdout, "%d files recorded (%d hashed, %d hashes reused, %d oversized metadata-only), %d runtimes, %d listening ports (%s).\n",
+		len(value.Files), value.Stats.FilesHashed, value.Stats.FileHashesReused, value.Stats.FilesSkippedLarge, len(value.Runtimes), len(value.Ports), relative)
 	if warnings > 0 {
 		fmt.Fprintf(app.Stdout, "%d detector warning%s stored with the checkpoint.\n", warnings, plural(warnings))
 	}
@@ -280,12 +334,13 @@ func (app App) flagSet(name string) *flag.FlagSet {
 }
 
 func (app App) usage(writer io.Writer) {
-	fmt.Fprintln(writer, "WhatChanged — show what changed since a command last worked")
+	fmt.Fprintln(writer, "WhatChanged - show what changed since this exact command last worked")
 	fmt.Fprintln(writer)
 	fmt.Fprintln(writer, "Usage:")
-	fmt.Fprintln(writer, "  what-changed run [--name NAME] -- COMMAND [ARG...]  Run and checkpoint on success")
+	fmt.Fprintln(writer, "  what-changed run [--name NAME] -- COMMAND [ARG...]  Save this command's baseline on success")
 	fmt.Fprintln(writer, "  what-changed mark [--name NAME] [--note TEXT]       Record a manual checkpoint")
-	fmt.Fprintln(writer, "  what-changed diff [--name NAME] [--json]            Rank changes since a checkpoint")
+	fmt.Fprintln(writer, "  what-changed diff [--verbose|--json] -- COMMAND      Diff since this command last passed")
+	fmt.Fprintln(writer, "  what-changed diff [--name NAME]                      Diff a named checkpoint")
 	fmt.Fprintln(writer, "  what-changed list [--json]                           List local checkpoints")
 	fmt.Fprintln(writer)
 	fmt.Fprintln(writer, "All checkpoint data stays under .what-changed/ in the project root.")

@@ -1,13 +1,14 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/local-first/what-changed/internal/snapshot"
+	"github.com/dineshsuthar123/UseFull-Tools/internal/snapshot"
 )
 
 func TestSaveAndLoadLatestAndNamedCheckpoints(t *testing.T) {
@@ -66,6 +67,69 @@ func TestListIgnoresCorruptCheckpoint(t *testing.T) {
 	_, _, err = Load(root, "missing")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Load error=%v, want ErrNotFound", err)
+	}
+}
+
+func TestLoadByCommandIDMaintainsIndependentBaselines(t *testing.T) {
+	root := t.TempDir()
+	goOld := minimalSnapshot(root, "go-test-old", time.Unix(100, 0))
+	goOld.CommandID = "go-test-aaaaaaaa"
+	npm := minimalSnapshot(root, "npm-test", time.Unix(200, 0))
+	npm.CommandID = "npm-test-bbbbbbbb"
+	goNew := minimalSnapshot(root, "go-test-new", time.Unix(300, 0))
+	goNew.CommandID = goOld.CommandID
+	for _, value := range []*snapshot.Snapshot{goOld, npm, goNew} {
+		if _, err := Save(root, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loadedGo, _, err := LoadByCommandID(root, goOld.CommandID)
+	if err != nil || !loadedGo.CapturedAt.Equal(goNew.CapturedAt) {
+		t.Fatalf("Go baseline=%#v err=%v, want newest Go snapshot", loadedGo, err)
+	}
+	loadedNPM, _, err := LoadByCommandID(root, npm.CommandID)
+	if err != nil || !loadedNPM.CapturedAt.Equal(npm.CapturedAt) {
+		t.Fatalf("npm baseline=%#v err=%v", loadedNPM, err)
+	}
+}
+
+func TestReadUpgradesV1AndRemovesLegacyPlaintext(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, directoryName)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]any{
+		"schemaVersion": 1, "label": "last-success", "capturedAt": "2024-01-01T00:00:00Z", "root": root,
+		"trigger": map[string]any{"kind": "successful-command", "command": []string{"go", "test", "./..."}},
+		"files":   map[string]any{"main.go": map[string]any{"sha256": "abc", "size": 10, "kind": "source"}},
+		"environment": map[string]any{
+			"MY_INTERNAL_VALUE": map[string]any{"sha256": "one", "value": "must-not-survive"},
+			"NODE_ENV":          map[string]any{"sha256": "two", "value": "test"},
+		},
+		"runtimes": map[string]any{}, "ports": map[string]any{}, "containers": map[string]any{},
+		"complete": map[string]any{"files": true, "environment": true}, "stats": map[string]any{},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "legacy.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, err := read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.SchemaVersion != snapshot.SchemaVersion || value.CommandID == "" || !value.Files["main.go"].Tracked {
+		t.Fatalf("legacy metadata not upgraded: %#v", value)
+	}
+	if state := value.Environment["MY_INTERNAL_VALUE"]; state.Value != "" || state.Sensitivity != "unknown" {
+		t.Fatalf("legacy plaintext survived upgrade: %#v", state)
+	}
+	if state := value.Environment["NODE_ENV"]; state.Value != "test" || state.Sensitivity != "safe" {
+		t.Fatalf("safe legacy value not retained: %#v", state)
 	}
 }
 
